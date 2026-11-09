@@ -21,7 +21,8 @@ from contextlib import suppress
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
-  # PyMuPDF
+
+import fitz# PyMuPDF
 from dotenv import load_dotenv
 from telegram import (
     InlineKeyboardButton,
