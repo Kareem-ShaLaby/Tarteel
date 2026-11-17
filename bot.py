@@ -16,13 +16,13 @@ import logging
 import math
 import os
 import re
+import threading
 import zipfile
 from contextlib import suppress
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import fitz# PyMuPDF
 from dotenv import load_dotenv
 from telegram import (
     InlineKeyboardButton,
@@ -62,6 +62,10 @@ DEFAULT_TZ = os.getenv("DEFAULT_TZ", "Africa/Cairo")
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "page_cache"))
 CACHE_DIR.mkdir(exist_ok=True)
 ZOOM = float(os.getenv("RENDER_ZOOM", "2.0"))
+# صفحات المصحف متخزّنة كصور في قناة تليجرام، وروابطها (صفحة -> رابط الرسالة) في الملف ده.
+PAGE_LINKS_FILE = os.getenv("PAGE_LINKS_FILE", "page_links.json")
+# اختياري: لو الملف فيه أرقام رسايل بس من غير روابط، حط ID القناة هنا (زي -1001234567890).
+STORAGE_CHANNEL_ID = int(os.getenv("STORAGE_CHANNEL_ID", "0")) or None
 
 # الجروب اللي بيتثبّت فيه ملف النسخة الاحتياطية (البوت لازم يكون أدمن فيه
 # بصلاحية تثبيت الرسايل ومسحها).
@@ -200,6 +204,8 @@ state: dict = {"version": 3, "updated_at": None, "users": {}, "stats": {}}
 revision = 0
 saved_revision = 0
 restored = False  # مفيش رفع قبل قراءة النسخة المثبّتة (عشان منكتبش داتا فاضية فوقها)
+backup_retry_at = 0.0  # لو التثبيت فشل، منحاولش تاني قبل الوقت ده (loop time)
+PIN_FAIL_BACKOFF = 600  # ثواني
 backup_msg_id: int | None = None
 save_lock: asyncio.Lock | None = None
 APP: Application | None = None
@@ -458,13 +464,15 @@ async def flush(bot, force: bool = False):
       فالملف دايماً متسق. ولو حصل تغيير أثناء الرفع، revision بيبقى أكبر من
       saved_revision والدورة الجاية بترفعه.
     """
-    global saved_revision, backup_msg_id
+    global saved_revision, backup_msg_id, backup_retry_at
     if not restored:
         log.warning("flush skipped: backup not restored yet.")
         return
     async with save_lock:
         if not force and revision == saved_revision:
             return  # حد تاني رفع قبلنا ومفيش جديد
+        if not force and asyncio.get_running_loop().time() < backup_retry_at:
+            return  # التثبيت فشل قريب، نستنى شوية
         snap_rev = revision
         data = json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8")
         blob = pack_state(data)
@@ -483,19 +491,30 @@ async def flush(bot, force: bool = False):
                 caption=f"🗂 نسخة احتياطية • {ar(users)} مستخدم • {stamp}",
                 disable_notification=True,
             )
+        except TelegramError as e:
+            # saved_revision متغيّرش، فالنسخة لسه متسخة وهيحاول تاني.
+            log.error("Backup upload failed: %s", e)
+            return
+
+        try:
             await bot.pin_chat_message(
                 BACKUP_CHAT_ID, msg.message_id, disable_notification=True
             )
         except TelegramError as e:
-            # saved_revision متغيّرش، فالنسخة لسه متسخة وهيحاول تاني.
+            # الرفع نجح بس التثبيت فشل: بنمسح الرسالة الجديدة عشان الجروب
+            # ميتملاش بنسخ كل ٣٠ ثانية، والنسخة المثبّتة القديمة تفضل زي ما هي.
             log.error(
-                "Backup failed: %s — make sure the bot is an admin in the group "
-                "with the 'Pin messages' permission.",
+                "Backup pin failed: %s — make sure the bot is an admin in the "
+                "group with the 'Pin messages' permission.",
                 e,
             )
+            with suppress(TelegramError):
+                await bot.delete_message(BACKUP_CHAT_ID, msg.message_id)
+            backup_retry_at = asyncio.get_running_loop().time() + PIN_FAIL_BACKOFF
             return
 
         saved_revision = snap_rev
+        backup_retry_at = 0.0
         old = backup_msg_id
         backup_msg_id = msg.message_id
         if old and old != msg.message_id:
@@ -514,7 +533,83 @@ async def autosave_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ───────────────────────── صفحات المصحف ─────────────────────────
-_pdf = fitz.open(QURAN_PDF)
+LINK_RE = re.compile(
+    r"(?:https?://)?(?:t\.me|telegram\.me)/(?:c/(\d+)|([A-Za-z]\w{3,}))/(?:\d+/)?(\d+)"
+)
+
+
+def parse_link(text) -> tuple | None:
+    """https://t.me/c/123456/45 -> (-100123456, 45) ، و t.me/username/45 -> (@username, 45)."""
+    m = LINK_RE.search(str(text))
+    if not m:
+        return None
+    internal, username, mid = m.groups()
+    return (int(f"-100{internal}") if internal else f"@{username}", int(mid))
+
+
+def _to_ref(v) -> tuple | None:
+    if isinstance(v, dict):
+        v = v.get("link") or v.get("url") or v.get("message_id")
+    if isinstance(v, str) and (ref := parse_link(v)):
+        return ref
+    if STORAGE_CHANNEL_ID and str(v).strip().isdigit():
+        return (STORAGE_CHANNEL_ID, int(str(v).strip()))
+    return None
+
+
+def load_page_links(path: Path | None = None) -> dict:
+    """{رقم الصفحة: (القناة, رقم الرسالة)}. بيقبل JSON (dict أو list) أو ملف نصي."""
+    path = path or Path(PAGE_LINKS_FILE)
+    if not path.exists():
+        return {}
+    raw = path.read_text(encoding="utf-8-sig")
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        items = list(data.items())
+    elif isinstance(data, list):
+        items = list(enumerate(data, 1))  # أول عنصر = صفحة ١
+    else:  # ملف نصي: سطر لكل صفحة، إما "٥ <رابط>" أو الرابط لوحده بالترتيب
+        items = []
+        for n, line in enumerate((ln for ln in raw.splitlines() if ln.strip()), 1):
+            m = re.match(r"^\s*(\d+)\s*[:=,\t ]\s*(\S.*)$", line)
+            items.append((m.group(1), m.group(2)) if m else (n, line))
+    links = {}
+    for k, v in items:
+        try:
+            page = int(en_digits(str(k)))
+        except ValueError:
+            continue
+        ref = _to_ref(v)
+        if ref and 1 <= page <= TOTAL_PAGES:
+            links[page] = ref
+    return links
+
+
+PAGE_LINKS = load_page_links()
+_pdf = None  # بيتفتح بس لو صفحة مش موجودة في الكاش واحتجنا نرسمها من الـ PDF
+
+
+def _get_pdf():
+    global _pdf
+    if _pdf is None:
+        if not Path(QURAN_PDF).exists():
+            raise FileNotFoundError(
+                f"Page image missing from {CACHE_DIR}/ and no PDF found at '{QURAN_PDF}'."
+            )
+        import fitz  # PyMuPDF
+        _pdf = fitz.open(QURAN_PDF)
+    return _pdf
+
+
+def missing_cached_pages() -> list[int]:
+    """صفحات مالهاش لا رابط في القناة ولا صورة في الكاش."""
+    return [
+        p for p in range(1, TOTAL_PAGES + 1)
+        if p not in PAGE_LINKS and not (CACHE_DIR / f"{p}.jpg").exists()
+    ]
 
 
 def today_pages(user: dict) -> list[int]:
@@ -523,15 +618,25 @@ def today_pages(user: dict) -> list[int]:
     return [((start - 1 + i) % TOTAL_PAGES) + 1 for i in range(n)]
 
 
+_render_lock = threading.Lock()  # PyMuPDF مش thread-safe
+
+
 def render_page(page_no: int) -> Path:
     out = CACHE_DIR / f"{page_no}.jpg"
-    if not out.exists():
-        pix = _pdf[page_no - 1 + PDF_OFFSET].get_pixmap(matrix=fitz.Matrix(ZOOM, ZOOM))
-        pix.save(str(out), jpg_quality=88)
+    if out.exists():
+        return out
+    with _render_lock:
+        if not out.exists():
+            # بنكتب في ملف مؤقت وبعدين نبدّله، عشان محدش يقرا صورة نصها مكتوب.
+            tmp = out.with_name(f"{page_no}.tmp.jpg")
+            import fitz  # PyMuPDF
+            pix = _get_pdf()[page_no - 1 + PDF_OFFSET].get_pixmap(matrix=fitz.Matrix(ZOOM, ZOOM))
+            pix.save(str(tmp), jpg_quality=88)
+            tmp.replace(out)
     return out
 
 
-async def send_pages(bot, chat_id: int, pages: list[int]):
+async def send_pages_local(bot, chat_id: int, pages: list[int]):
     paths = await asyncio.to_thread(lambda: [render_page(p) for p in pages])
     # الألبوم في تليجرام بيشيل ١٠ صور بالكتير.
     for i in range(0, len(paths), 10):
@@ -546,6 +651,36 @@ async def send_pages(bot, chat_id: int, pages: list[int]):
                 for p, path in chunk
             ]
             await bot.send_media_group(chat_id, media)
+
+
+async def send_pages(bot, chat_id: int, pages: list[int]):
+    """بيبعت الصفحات بالترتيب: اللي ليها رابط في قناة التخزين بتتنسخ منها مباشرة
+    (من غير تحميل أو رفع)، واللي مالهاش بتتبعت من الكاش/الـ PDF."""
+    i = 0
+    while i < len(pages):
+        if pages[i] in PAGE_LINKS:
+            src = PAGE_LINKS[pages[i]][0]
+            mids = []
+            while (
+                i < len(pages)
+                and len(mids) < 100  # حد تليجرام لنسخ الرسايل في طلب واحد
+                and pages[i] in PAGE_LINKS
+                and PAGE_LINKS[pages[i]][0] == src
+            ):
+                mids.append(PAGE_LINKS[pages[i]][1])
+                i += 1
+            sent = await bot.copy_messages(chat_id, src, mids)
+            if len(sent) < len(mids):
+                log.warning(
+                    "Only %d of %d pages were copied from %s (deleted or wrong message ids?)",
+                    len(sent), len(mids), src,
+                )
+        else:
+            run = []
+            while i < len(pages) and pages[i] not in PAGE_LINKS:
+                run.append(pages[i])
+                i += 1
+            await send_pages_local(bot, chat_id, run)
 
 
 # ───────────────────────── أدوات مساعدة ─────────────────────────
@@ -579,6 +714,7 @@ def main_menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("📊 تقدّمي", callback_data="progress"),
                 InlineKeyboardButton("⚙️ الإعدادات", callback_data="settings"),
             ],
+            [InlineKeyboardButton("📚 طريقة الاستخدام", callback_data="howto")],
         ]
     )
 
@@ -1027,6 +1163,56 @@ def prayer_keyboard(u: dict) -> InlineKeyboardMarkup:
     )
 
 
+# ───────────────────────── طريقة الاستخدام ─────────────────────────
+HOWTO_TEXT = (
+    "📚 <b>طريقة استخدام ترتيل</b>\n\n"
+    "<b>الفكرة:</b> بتحدد وردك اليومي، وأنا ببعتلك صفحات النهاردة بس من المصحف "
+    "في الميعاد اللي تختاره، وبفكّرك قبل الصلوات.\n\n"
+    "<b>🚀 ابدأ بـ ٤ خطوات</b>\n"
+    "١. حدد وردك: /pages (عدد صفحات في اليوم) أو /goal (ختمة في عدد أيام)\n"
+    "٢. حدد ميعاد التذكير: /time\n"
+    "٣. اختار مدينتك: /timezone\n"
+    "٤. لما تخلّص قراءة دوس على زرار «✅ خلّصت وردي»\n\n"
+    "<b>📖 القراءة والتقدّم</b>\n"
+    "/today — يبعتلك ورد النهاردة (صور الصفحات)\n"
+    "/progress — تقدّمك، وأيامك ورا بعض، وعدد الختمات، وحالتك من هدف الختمة\n"
+    "/setpage 120 — تبدأ وردك من صفحة معيّنة (من ١ لـ ٦٠٤)\n\n"
+    "<b>⚙️ الإعدادات</b>\n"
+    "/settings — كل إعداداتك في مكان واحد\n"
+    "/pages — عدد الصفحات في اليوم. لو عندك هدف ختمة شغّال وغيّرت العدد "
+    "هيتلغي الهدف\n"
+    "/goal — حدد تخلّص المصحف في كام يوم، وأنا أحسبلك الصفحات اليومية\n"
+    "/time — ميعاد التذكير اليومي (بنظام ٢٤ ساعة، زي 05:30)\n"
+    "/stop — إيقاف التذكير (وتشغّله تاني من /time)\n"
+    "/timezone — المدينة أو المنطقة الزمنية، أو ابعت موقعك\n\n"
+    "<b>🕌 تنبيهات الصلاة</b>\n"
+    "/prayer — شغّل التنبيهات واختار الصلوات اللي عايز تتنبّه ليها. هبعتلك قبل "
+    "الصلاة بساعة وبنص ساعة، ولو دوست «✅ لقد صليت» مش هنبّهك تاني لنفس الصلاة. "
+    "محتاج تحدد مدينتك أو موقعك الأول، والمواعيد تقريبية.\n\n"
+    "<b>🧭 أوامر تانية</b>\n"
+    "/menu — القائمة الرئيسية\n"
+    "/how_to_use — الشرح ده\n\n"
+    "<b>💡 ملحوظة:</b> وردك مبيتقدّمش للصفحات اللي بعدها غير لما تدوس "
+    "«✅ خلّصت وردي»، فلو نسيت هتلاقي نفس الصفحات تاني بكرة.\n\n"
+    "تقبّل الله منك 🤍"
+)
+
+
+def set_pages_per_day(chat_id: int, n: int) -> str:
+    """بيغيّر عدد الصفحات. لو فيه هدف ختمة شغّال بيتلغي لأن حسابه كان مبني على العدد القديم."""
+    u = get_user(chat_id)
+    if u["goal_days"] and n != u["pages_per_day"]:
+        update_user(
+            chat_id, pages_per_day=n, goal_days=None, goal_start=None, goal_read=0
+        )
+        return (
+            f"✅ وردك دلوقتي {ar(n)} صفحة في اليوم\n"
+            "🎯 هدف الختمة اتلغى لأن عدد الصفحات اتغيّر. تقدر تحدد هدف جديد من /goal"
+        )
+    update_user(chat_id, pages_per_day=n)
+    return f"✅ وردك دلوقتي {ar(n)} صفحة في اليوم"
+
+
 # ───────────────────────── الأوامر ─────────────────────────
 WELCOME = (
     "السلام عليكم ورحمة الله 🌙\n"
@@ -1048,6 +1234,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("القائمة", reply_markup=main_menu())
+
+
+async def howto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HOWTO_TEXT, parse_mode="HTML")
 
 
 async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1209,6 +1399,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "today":
         await deliver_today(bot, chat_id, u)
+    elif data == "howto":
+        await bot.send_message(chat_id, HOWTO_TEXT, parse_mode="HTML")
     elif data == "menu":
         await edit_or_send(q, bot, "القائمة", main_menu())
     elif data == "settings":
@@ -1295,8 +1487,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await bot.send_message(chat_id, "ابعت رقم من ١ لـ ١٠٠")
     elif data.startswith("pages_") and data[6:].isdigit():
         n = int(data[6:])
-        update_user(chat_id, pages_per_day=n)
-        await q.edit_message_text(f"✅ وردك دلوقتي {ar(n)} صفحة في اليوم")
+        if 1 <= n <= 100:
+            await edit_or_send(q, bot, set_pages_per_day(chat_id, n))
     elif data == "done":
         await mark_done(context, chat_id, q)
 
@@ -1369,9 +1561,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not text.isdigit() or not 1 <= int(text) <= 100:
             await update.message.reply_text("ابعت رقم بين ١ و ١٠٠")
             return
-        update_user(chat_id, pages_per_day=int(text))
+        msg = set_pages_per_day(chat_id, int(text))
         context.user_data.pop("awaiting")
-        await update.message.reply_text(f"✅ وردك دلوقتي {ar(int(text))} صفحة في اليوم")
+        await update.message.reply_text(msg)
     elif awaiting == "goal":
         if not text.isdigit() or not MIN_GOAL_DAYS <= int(text) <= MAX_GOAL_DAYS:
             await update.message.reply_text(
@@ -1450,6 +1642,23 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     global save_lock, outbox, outbox_task, APP
     APP = app
+    log.info("Loaded %d page links from %s.", len(PAGE_LINKS), PAGE_LINKS_FILE)
+    for src in {ref[0] for ref in PAGE_LINKS.values()}:
+        try:
+            await app.bot.get_chat(src)
+        except TelegramError as e:
+            log.warning(
+                "Cannot access storage channel %s: %s — add the bot as an admin there.", src, e
+            )
+    missing = missing_cached_pages()
+    if missing:
+        log.warning(
+            "%d of %d pages have no link and no cached image, so they can't be sent. "
+            "First missing: %s",
+            len(missing), TOTAL_PAGES, missing[:10],
+        )
+    else:
+        log.info("All %d pages are available.", TOTAL_PAGES)
     save_lock = asyncio.Lock()
     outbox = Outbox()
     await restore_state(app.bot)
@@ -1485,6 +1694,7 @@ def main():
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu))
+    app.add_handler(CommandHandler("how_to_use", howto_cmd))
     app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CommandHandler("goal", goal_cmd))
     app.add_handler(CommandHandler("prayer", prayer_cmd))
@@ -1499,7 +1709,9 @@ def main():
     app.add_handler(CommandHandler("health", health_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.LOCATION, on_location))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_text)
+    )
     app.run_polling()
 
 
