@@ -557,6 +557,22 @@ def _to_ref(v) -> tuple | None:
     return None
 
 
+def quran_links(q) -> dict:
+    """بيقرا الصيغة {"chat_id": ..., "pages": {"1": رقم_الرسالة, ...}} (زي مفتاح quran في النسخة الاحتياطية)."""
+    if not isinstance(q, dict) or not isinstance(q.get("pages"), dict):
+        return {}
+    chat = q.get("chat_id") or STORAGE_CHANNEL_ID
+    links = {}
+    for k, v in q["pages"].items():
+        try:
+            page, mid = int(en_digits(str(k))), int(v)
+        except (TypeError, ValueError):
+            continue
+        if chat and 1 <= page <= TOTAL_PAGES:
+            links[page] = (chat, mid)
+    return links
+
+
 def load_page_links(path: Path | None = None) -> dict:
     """{رقم الصفحة: (القناة, رقم الرسالة)}. بيقبل JSON (dict أو list) أو ملف نصي."""
     path = path or Path(PAGE_LINKS_FILE)
@@ -567,6 +583,8 @@ def load_page_links(path: Path | None = None) -> dict:
         data = json.loads(raw)
     except ValueError:
         data = None
+    if isinstance(data, dict) and (found := quran_links(data.get("quran", data))):
+        return found
     if isinstance(data, dict):
         items = list(data.items())
     elif isinstance(data, list):
@@ -1642,6 +1660,12 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     global save_lock, outbox, outbox_task, APP
     APP = app
+    save_lock = asyncio.Lock()
+    outbox = Outbox()
+    await restore_state(app.bot)
+    # روابط الصفحات ممكن تيجي من الملف، أو من مفتاح quran جوه النسخة المثبّتة.
+    for page, ref in quran_links(state.get("quran")).items():
+        PAGE_LINKS.setdefault(page, ref)
     log.info("Loaded %d page links from %s.", len(PAGE_LINKS), PAGE_LINKS_FILE)
     for src in {ref[0] for ref in PAGE_LINKS.values()}:
         try:
@@ -1659,9 +1683,6 @@ async def post_init(app: Application):
         )
     else:
         log.info("All %d pages are available.", TOTAL_PAGES)
-    save_lock = asyncio.Lock()
-    outbox = Outbox()
-    await restore_state(app.bot)
     for u in state["users"].values():
         schedule_reminder(app, u)
     outbox_task = asyncio.create_task(outbox.run(app.bot))
